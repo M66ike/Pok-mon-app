@@ -200,7 +200,94 @@ public class MainActivity extends Activity {
         if(jobs.isEmpty()){
             appWeb.evaluateJavascript("window.onScanFinished()",null);return;
         }
-        scanning=true;jobIndex=0;nextJob();
+        scanning=true;jobIndex=0;if(getApiKey().isEmpty())nextJob();else nextApiJob();
+    }
+
+
+    // A user-provided SoldComps API key is private to this device, not committed
+    // or sent to our servers. The third-party provider receives the queries.
+    private String getApiKey(){
+        return getSharedPreferences("api_credentials",MODE_PRIVATE).getString("soldcomps","");
+    }
+    private void nextApiJob(){
+        if(!scanning)return;
+        if(jobIndex>=jobs.size()){
+            scanning=false; currentJob=null;
+            appWeb.evaluateJavascript("window.onScanFinished()",null);
+            return;
+        }
+        JSONObject job=jobs.get(jobIndex++);
+        currentJob=job;
+        new Thread(()->{
+            try{
+                String query=job.optString("query");
+                if(query.isEmpty()){
+                    android.net.Uri parsed=android.net.Uri.parse(job.optString("url"));
+                    query=parsed.getQueryParameter("_nkw");
+                }
+                if(query==null||query.trim().isEmpty())throw new Exception("Empty search");
+                String url="https://api.sold-comps.com/v1/scrape?keyword="+
+                    java.net.URLEncoder.encode(query,"UTF-8")+
+                    "&ebaySite=ebay.co.uk&itemLocation=domestic&sold=true&count=240"+
+                    "&page=1&hydrateBoa=true&includeCompleteListing=true&exactMatch=true";
+                java.net.HttpURLConnection con=(java.net.HttpURLConnection)new java.net.URL(url).openConnection();
+                con.setRequestMethod("GET");
+                con.setConnectTimeout(12000);
+                con.setReadTimeout(35000);
+                con.setRequestProperty("Authorization","Bearer "+getApiKey());
+                con.setRequestProperty("Accept","application/json");
+                int status=con.getResponseCode();
+                java.io.InputStream stream=status>=200&&status<300?con.getInputStream():con.getErrorStream();
+                java.io.ByteArrayOutputStream buf=new java.io.ByteArrayOutputStream();
+                if(stream!=null){
+                    byte[] bytes=new byte[8192];int n;
+                    while((n=stream.read(bytes))!=-1&&buf.size()<3000000)buf.write(bytes,0,n);
+                    stream.close();
+                }
+                con.disconnect();
+                if(status!=200)throw new Exception("API returned HTTP "+status+
+                    (status==401?" — check API key":status==403?" — check request quota":""));
+                JSONObject body=new JSONObject(buf.toString("UTF-8"));
+                JSONArray raw=body.optJSONArray("items"),sales=new JSONArray();
+                if(raw!=null)for(int i=0;i<raw.length();i++){
+                    JSONObject item=raw.optJSONObject(i);
+                    if(item==null||!"sold".equalsIgnoreCase(item.optString("listingType","sold")))continue;
+                    if(!"GBP".equalsIgnoreCase(item.optString("soldCurrency")))continue;
+                    boolean offer=item.optBoolean("bestOfferAccepted",false);
+                    boolean hydrated=item.optBoolean("boaHydrated",false);
+                    boolean validOffer=hydrated&&"GBP".equalsIgnoreCase(item.optString("boaAcceptedCurrency"));
+                    double price=offer&&validOffer?item.optDouble("boaAcceptedPrice",0):
+                                                  item.optDouble("soldPrice",0);
+                    String date=item.optString("endedAt");
+                    if(price<=0||date==null||date.length()<10)continue;
+                    JSONObject sale=new JSONObject();
+                    sale.put("title",item.optString("title"));
+                    sale.put("url",item.optString("url"));
+                    sale.put("date",date.substring(0,10));
+                    sale.put("price",price);
+                    sale.put("offer",offer);
+                    sale.put("verified",!offer||validOffer);
+                    sale.put("id",item.optString("itemId"));
+                    sales.put(sale);
+                }
+                JSONObject payload=new JSONObject();
+                payload.put("job",job);payload.put("provider","soldcomps");
+                payload.put("sales",sales);
+                handler.post(()->{
+                    appWeb.evaluateJavascript("window.onNativeCapture("+
+                        JSONObject.quote(payload.toString())+")",null);
+                    // Let WebView finish recording the response before next query.
+                    handler.postDelayed(this::nextApiJob,500);
+                });
+            }catch(Exception e){
+                String message=e.getMessage()==null?"Unknown error":e.getMessage();
+                handler.post(()->{
+                    appWeb.evaluateJavascript("window.onScanProgress("+
+                      JSONObject.quote("UK sold data: "+message)+")",null);
+                    nextApiJob();
+                });
+            }
+        }).start();
     }
 
     private void nextJob(){
@@ -266,6 +353,23 @@ public class MainActivity extends Activity {
     }
 
     public class Bridge {
+
+        @JavascriptInterface public boolean hasSoldCompsKey(){
+            return !getApiKey().isEmpty();
+        }
+        @JavascriptInterface public void setSoldCompsKey(String value){
+            String key=value==null?"":value.trim();
+            if(key.length()>500)return;
+            getSharedPreferences("api_credentials",MODE_PRIVATE).edit()
+                .putString("soldcomps",key).apply();
+        }
+        @JavascriptInterface public void openProviderSignup(){
+            runOnUiThread(()->{
+                Intent intent=new Intent(Intent.ACTION_VIEW,
+                    Uri.parse("https://sold-comps.com/dashboard"));
+                try{startActivity(intent);}catch(Exception ignored){}
+            });
+        }
         @JavascriptInterface public void openEbay(String url,String tracker,String search){
             runOnUiThread(()->openBrowser(url,tracker,search));
         }
